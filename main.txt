@@ -1,0 +1,294 @@
+/* SPDX-License-Identifier: BSD-3-Clause
+ * Copyright(c) 2010-2014 Intel Corporation
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+//#include <sche.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include<rte_ethdev.h>
+#include <rte_memory.h>
+#include <rte_launch.h>
+#include <rte_eal.h>
+#include <rte_per_lcore.h>
+#include <rte_lcore.h>
+#include <rte_debug.h>
+#include <rte_common.h>
+#include <rte_log.h>
+#include <rte_cycles.h>
+#include <rte_atomic.h>
+#include <rte_branch_prediction.h>
+#include <rte_ring.h>
+#include <rte_mempool.h>
+#include <rte_spinlock.h>
+#include <rte_malloc.h>
+
+#include <rte_config.h>
+#include <rte_byteorder.h>
+#include <rte_memzone.h>
+#include <rte_tailq.h>
+#include <rte_ether.h>
+#include <rte_ip.h>
+#include <rte_udp.h>
+#include <rte_string_fns.h>
+
+#include "dpdk.h"
+static int
+lcore_hello(__rte_unused void *arg)
+{
+	unsigned lcore_id;
+	lcore_id = rte_lcore_id();
+	printf("hello from core %u\n", lcore_id);
+	return 0;
+}
+#define DIE(msg, ...)                                       \
+    do {                                                    \
+        RTE_LOG(ERR, USER1, msg , ## __VA_ARGS__ );         \
+        exit(EXIT_FAILURE);                                 \
+    } while (0)
+
+#define MBUF_SIZE               (2048 + RTE_PKTMBUF_HEADROOM)
+#define NUM_MBUF				4096-1
+#define MEMPOOL_CACHE_SIZE 256
+void init_port(struct rte_mempool *mp);
+struct Request {
+    uint64_t runNs;
+    uint64_t genNs;
+};
+
+struct Response {
+    uint64_t runNs;
+    uint64_t genNs;
+};
+struct rte_mempool * mp;
+int dpdk_pork_id = 0;
+static const struct rte_eth_conf port_conf = 
+{
+	.rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN }
+};
+void pin_to_cpu(int core){
+	int ret;
+	cpu_set_t cpuset;
+	pthread_t thread;
+
+	thread = pthread_self();
+	CPU_ZERO(&cpuset);
+	CPU_SET(core, &cpuset);
+	ret = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+	if (ret != 0)
+	    printf("Cannot pin thread\n");
+}
+void init_port(struct rte_mempool *mp)
+{
+	unsigned n_ports;
+	n_ports =  rte_eth_dev_count_avail();
+	if(n_ports == 0)
+	{
+		DIE("no Ethernet ports detected\n");
+	}
+	rte_eth_dev_configure(dpdk_pork_id, 1, 1, &port_conf);
+	int ret = rte_eth_rx_queue_setup(dpdk_pork_id, 0, 128,  rte_eth_dev_socket_id(0), NULL, mp);
+	if(ret < 0 )
+	{
+		DIE("fail to setup rx queue!\n");
+	}
+	ret = rte_eth_tx_queue_setup(dpdk_pork_id, 0, 512,  rte_eth_dev_socket_id(0), NULL);
+	if(ret < 0 )
+	{
+		DIE("fail to setup tx queue!\n");
+	}
+	ret = rte_eth_dev_start(dpdk_pork_id);
+	if(ret < 0)
+	{
+		DIE("fail to start dev!\n");
+	}
+
+}
+#define ntoh16(x)	(rte_be_to_cpu_16(x))
+#define ntoh32(x)	(rte_be_to_cpu_32(x))
+#define ntoh64(x)	(rte_be_to_cpu_64(x))
+
+#define hton16(x)	(rte_cpu_to_be_16(x))
+#define hton32(x)	(rte_cpu_to_be_32(x))
+#define hton64(x)	(rte_cpu_to_be_64(x))
+
+#define TX_SEND_NUM 100
+uint64_t tx_num = 0;
+uint64_t rx_num = 0;
+
+#define UDP_PKT_SIZE (sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr))
+void *pt_send(void *c)
+{
+	pin_to_cpu(29);
+	/*
+	struct rte_ether_addr src_addr = {{0xe4,0x43,0x4b,0xe6,0xbc,0x00}};
+	struct rte_ether_addr dst_addr = {{0xe4,0x43,0x4b,0xe6,0xbc,0x00}};
+	uint16_t ether_type = 0x0800; 	
+	struct Message {
+		char data[10];
+	};
+	struct Message *msg;
+	struct Message obj = {{'H','e','l','l','o','2','0','1','8'}};
+	while(true)
+	{
+		uint16_t           eth_type,udp_port;
+		uint32_t           ip_addr;
+		struct rte_udp_hdr    *udp_h;
+		struct rte_ipv4_hdr   *ip_h;
+		struct rte_ether_hdr  *eth_h;
+		struct rte_ether_addr  eth_addr;
+		struct rte_mbuf *pkt = rte_pktmbuf_alloc(mp);
+		eth_h = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+		eth_h->dst_addr = dst_addr;
+		eth_h->src_addr = src_addr;
+		eth_h->ether_type = hton16(RTE_ETHER_TYPE_IPV4);
+		msg = (struct Message*) (rte_pktmbuf_mtod(pkt,char*) + sizeof(struct rte_ether_hdr));
+		*msg = obj;
+		int pkt_size = sizeof(struct Message) + sizeof(struct rte_ether_hdr);
+		pkt->data_len = pkt_size;
+		pkt->pkt_len = pkt_size;
+		rte_eth_tx_burst(0,0,pkt,1);
+		rte_pktmbuf_free(pkt);
+	}*/
+
+	while(true)
+	{
+		struct rte_mbuf *pkt = rte_pktmbuf_alloc(mp);
+		uint16_t           eth_type,udp_port;
+		uint32_t           ip_addr;
+		struct rte_udp_hdr    *udp_h;
+		struct rte_ipv4_hdr   *ip_h;
+		struct rte_ether_hdr  *eth_h;
+		struct rte_ether_addr  eth_addr;
+		int l2_len;
+		eth_h = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+		l2_len = sizeof(*eth_h);
+		ip_h = (struct rte_ipv4_hdr *) ((char *) eth_h + l2_len);
+		udp_h = (struct rte_udp_hdr *) ((char *) ip_h + sizeof(*ip_h));
+		unsigned char *payload;
+		payload = (unsigned char *)((char *)udp_h + sizeof(*udp_h));
+		struct rte_ether_addr src_addr = {{0xe4,0x43,0x4b,0xe6,0xbc,0x00}};
+		struct rte_ether_addr dst_addr = {{0xe4,0x43,0x4b,0x76,0x27,0x96}};
+		eth_h->dst_addr = dst_addr;
+		eth_h->src_addr = src_addr;
+		/*
+		eth_h->dst_addr.addr_bytes[0] = 0xe4;
+		eth_h->dst_addr.addr_bytes[1] = 0x43;
+		eth_h->dst_addr.addr_bytes[2] = 0x4b;
+		eth_h->dst_addr.addr_bytes[3] = 0x76;
+		eth_h->dst_addr.addr_bytes[4] = 0x27;
+		eth_h->dst_addr.addr_bytes[5] = 0x96;
+		eth_h->src_addr.addr_bytes[0] = 0xe4;
+		eth_h->src_addr.addr_bytes[1] = 0x43;
+		eth_h->src_addr.addr_bytes[2] = 0x4b;
+		eth_h->src_addr.addr_bytes[3] = 0xe6;
+		eth_h->src_addr.addr_bytes[4] = 0xbc;
+		eth_h->src_addr.addr_bytes[5] = 0;
+		*/
+		eth_h->ether_type = hton16(RTE_ETHER_TYPE_IPV4);
+		ip_h->type_of_service = 0;
+		ip_h->total_length = hton16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(struct Response));
+		ip_h->packet_id = 0;
+		ip_h->time_to_live = 64;
+		ip_h->next_proto_id = IPPROTO_UDP;
+		ip_h->hdr_checksum = 0;
+		ip_h->src_addr = hton32(0xc0aa0002);
+		ip_h->dst_addr = hton32(0xc0aa0002);
+		ip_h->version_ihl = sizeof(struct rte_ipv4_hdr) / 4;
+		ip_h->version_ihl = ip_h->version_ihl<<4 | 4; 
+		ip_h->hdr_checksum = chksum_internet((void *)ip_h, sizeof(struct rte_ipv4_hdr));
+		udp_h->src_port = hton16(5678);
+		udp_h->dst_port = hton16(1234);
+		udp_h->dgram_len = hton16(sizeof(struct Response) + sizeof(struct rte_udp_hdr));
+		udp_h->dgram_cksum = 0;
+		pkt->data_len = sizeof(struct Response) + UDP_PKT_SIZE;
+		pkt->pkt_len = sizeof(struct Response) + UDP_PKT_SIZE;
+		struct Request *req = (struct Request *)payload;
+	
+		req->genNs = getCurNs() + 1000;
+		req->runNs = 1000;
+		while(getCurNs() < req->genNs);
+		uint16_t nb_tx = rte_eth_tx_burst(0,0,&pkt,1);
+		printf("nb_tx %d\n", nb_tx);
+		tx_num++;
+		if(tx_num > 10) break;
+		out:
+		rte_pktmbuf_free(pkt);
+	}
+	
+}
+void *pt_recv(void *c)
+{
+	pin_to_cpu(30);
+	struct rte_mbuf *mbufs[128];
+	struct rte_mbuf *pkt;
+	while(true)
+	{
+		unsigned num_recv = rte_eth_rx_burst(dpdk_pork_id, 0, pkt, 128);
+		if(num_recv > 0)
+		{
+				while(num_recv--)
+				{
+					uint16_t           eth_type,udp_port;
+					uint32_t           ip_addr;
+					struct rte_udp_hdr    *udp_h;
+					struct rte_ipv4_hdr   *ip_h;
+					struct rte_ether_hdr  *eth_h;
+					struct rte_ether_addr  eth_addr;
+					int l2_len;
+					eth_h = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+					eth_type = rte_be_to_cpu_16(eth_h->ether_type);
+					printf("type :%x\n", eth_type);
+/*					l2_len = sizeof(*eth_h);
+					if(eth_type != RTE_ETHER_TYPE_IPV4) 	 goto out;
+					ip_h = (struct rte_ipv4_hdr *) ((char *) eth_h + l2_len);
+					if(ip_h->next_proto_id != IPPROTO_UDP) goto out;
+					udp_h = (struct rte_udp_hdr *) ((char *) ip_h + sizeof(*ip_h));
+					if(udp_h->dst_port != hton16(5678)) goto out;
+					struct Response *resp = (struct Response *)((char *)udp_h + sizeof(*udp_h));
+					uint64_t rttime  = getCurNs() - resp->genNs - 1000;
+					rx_num++;
+					printf("%llx\n", rttime);
+*/
+					out:
+					rte_pktmbuf_free(pkt);
+				}
+		}
+
+		
+
+	}
+
+}
+int main(int argc, char **argv)
+{
+	int ret;
+	unsigned lcore_id;
+	pthread_t receiver, sender;
+	ret = rte_eal_init(argc, argv);
+	if (ret < 0)
+		rte_panic("Cannot init EAL\n");
+	mp = rte_pktmbuf_pool_create("udp pool", NUM_MBUF, MEMPOOL_CACHE_SIZE, 8, 1500, SOCKET_ID_ANY);
+	if(mp == NULL)
+	{
+		rte_eal_cleanup();
+		exit(-1);
+	}
+	printf("mempool init success!\n");
+	init_port(mp);
+
+	pthread_create(&receiver, NULL, pt_recv, NULL);
+	pthread_create(&sender, NULL, pt_send, NULL);
+	pthread_join(receiver, NULL);
+	pthread_join(sender, NULL);
+	rte_eal_cleanup();
+
+	return 0;
+}
+
+
+
